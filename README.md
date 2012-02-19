@@ -3,7 +3,7 @@ rev-depgraph - graphing reverse dependencies in Gentoo
 
 WARNING: this is old as hell (2007), but I still used it up until beginning of 2012 with success.
 
-AFAIK this resolution algorithm was more correct back then (2007) than "emerge depclean", but things could have changed.
+AFAIK this resolution algorithm was more correct back then (2007) than "emerge --depclean", but things could have changed. One can choose a combination of compile, runtime and post-merge dependencies.
 
 Look at example-graph.png for a sample of generated graphviz dependency graph.
 
