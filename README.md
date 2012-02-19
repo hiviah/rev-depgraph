@@ -21,10 +21,10 @@ rev-depgraph vicinity -t graph -n 1 -c libpng | dot -Tpng -o libpng.png
 (will produce libpng.png image with the graph)
 
 REQUIREMENTS:
-    * Python >= 2.4 (dev-lang/python >= 2.4)
-    * gentoolkit (app-portage/gentoolkit >= 0.2.3-r1)
-    * optional graphviz (media-gfx/graphviz >= 2.12 -
-      actually I think >= 2.6 would be good enough, but not tested)
+
+* Python >= 2.4 (dev-lang/python >= 2.4)
+* gentoolkit (app-portage/gentoolkit >= 0.2.3-r1)
+* optional graphviz (media-gfx/graphviz >= 2.12 - actually I think >= 2.6 would be good enough, but not tested)
 
 INSTALL
 There is no install script, just copy the files somewhere in your PATH (e.g.
