@@ -1,0 +1,6 @@
+2007-11-18: Ondrej Mikle <ondrej.mikle [the-at-sign] gmail.com>
+	Release 0.1.2
+	
+	* created separate TODO, ChangeLog
+	* filtering by regexps in vicinity command (-r --regexp)
+	* cleaned some formatting in help

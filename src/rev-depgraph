@@ -1,0 +1,1068 @@
+#!/usr/bin/python
+# rev-depgraph
+# 
+# Distributed under the terms of the GNU General Public License v2
+#
+# Generates reverse graph of dependies of installed packages. Choice
+# is from any combination of compile deps, runtime deps and postmerge deps.
+# Computes and reports roots (i.e. packages that no other package depends on)
+# for world packages, system packages and free (non-world non-system) packages.
+# 
+# Similar to emerge --depclean, except it does not perform the cleaning, just
+# reports the packages and package dependency paths which could be removed with
+# more fine-grained options (dependency type(s), depth, etc).
+# 
+# Output is either textual or graphviz dot format (can be used to generate
+# image of the directed graph).
+# 
+# Available commands include reporting roots, reporting/graphing paths of
+# packages that might be uninstalled (like depclean pretend),
+# reporting/graphing vicinity of packages.
+# 
+# Meaning of dependencies according to
+# http://devmanual.gentoo.org/general-concepts/dependencies/index.html
+
+__author__ = "Ondrej Mikle"
+__email__ = "ondrej.mikle@gmail.com"
+__version__ = "0.1.2"
+__productname__ = "rev-depgraph"
+__description__ = "Gentoo Packages Reverse Dependency Graph Generator"
+
+import re
+import sys
+from types import *
+from optparse import OptionParser
+
+# portage (output module) and gentoolkit need special path modifications
+sys.path.insert(0, "/usr/lib/portage/pym")
+sys.path.insert(0, "/usr/lib/gentoolkit/pym")
+
+import gentoolkit
+import portage
+
+import gentoolkit.pprinter as pp
+from gentoolkit.pprinter import print_info, print_error, print_warn, die
+from gentoolkit import Config
+
+from gvgen import GvGen
+
+###################
+# Classes that actually do some of the useful stuff, like traversing the graph
+#
+class PkgPath:
+	""" Class representing a path in the graph """
+
+	def __init__(self):
+		""" Initializes with empty path """
+		self.path = []
+	
+	def addNode(self, node):
+		"""
+		Adds a node to the path. It is not checked if there is a edge between
+		the added node and some of the nodes already in path
+		"""
+		self.path.append(node)
+
+
+class NodeList:
+	""" Container for three lists of nodes: world, system and the rest (free packages) """
+
+	def __init__(self):
+		""" Initializes with empty lists """
+		self.world = []
+		self.system = []
+		self.free = []
+
+	def addWorldPkg(self, pkg):
+		""" Adds a world pkg """
+		self.world.append(pkg)
+
+	def addFreePkg(self, pkg):
+		""" Adds a free pkg """
+		self.free.append(pkg)
+
+	def addSystemPkg(self, pkg):
+		""" Adds a system pkg """
+		self.system.append(pkg)
+
+class Node:
+	"""
+	Represents node in the graph - a package
+	The semantics are:
+	-parents are the package that depends on this package
+	-children are packages this package requires
+	Node can have arbirary data associated with it.
+	"""
+
+	def __init__(self, package):
+		"""
+		Creates a node with given package, non-visited, without children,
+		without parents, without data, not removable.
+		"""
+		self.parents = [] #packages depending on this package
+		self.package = package
+		self.children = [] #packages this package depends on
+		self.visited = False #not yet visited
+		self.data = None #no data such as graphviz node data
+		self.removable = False #not marked removable by MarkingVisitor
+		self.selected = False #not marked selected by pkgspec
+
+	def addChild(self, child):
+		""" Adds a child to node """
+		self.children.append(child)
+
+	def addParent(self, parent):
+		""" Add a parent of node """
+		self.parents.append(parent)
+
+	def pkg(self):
+		""" Returns package associated with this node """
+		return self.package
+
+	def cpv(self):
+		""" Returns cpv (category-package-version) of the package """
+		return self.package.get_cpv()
+
+	def parentsRemovable(self):
+		""" Returns true if all parents are removable (recursively) """
+		for n in self.parents:
+			if not n.removable: return False
+			if not n.parentsRemovable(): return False
+		
+		return True
+
+	def removableChildren(self):
+		""" Returns list of removable children, only direct children are returned """
+		rc = []
+		for ch in self.children:
+			if ch.removable: rc.append(ch)
+		
+		return rc
+
+class GraphVisitor:
+	"""
+	Base class for graph traversing/iterating. Implements simple traversing in
+	arbitrary order and an iterator for that.
+
+	Subclasses should reimplement at least one of __iter__ and traverse(). These
+	mark visited nodes as visited, unvisit() resets visited state of all nodes
+	and state of iterator.
+
+	Calling visit() either uses iterator-style visiting or calls traverse(), depending
+	on setting of whole parameter in constructor.
+
+	Methods visit() and traverse() calls nodeAction(node) for each node - empty
+	by default, intended for subclasses to override.
+
+	If your node action is simple, you may use the lambda function which gets called
+	in nodeAction by default.
+	"""
+
+	class Iterator:
+		"""
+		Graph iterator base class over list of nodes.
+
+		You may have two iterators over the same  nodes at the same time,
+		however note that when one marks a node as visited, the other sees it
+		as visited as well.
+		"""
+	
+		def __init__(self, nodes):
+			""" Creates iterator over graph """
+			self.current = 0 #current node index
+			self.nodes = nodes
+
+		def next(self):
+			"""
+			Returns next node, the node is marked as visited.
+			Skips nodes marked visited before.
+			"""
+			while self.current < len(self.nodes):
+				node = self.nodes[self.current]
+				self.current += 1
+				if not node.visited:
+					node.visited = True
+					return node
+
+			raise StopIteration #no nonvisited nodes left
+
+
+	def __init__(self, graph, fn=lambda n: True, iterate=False):
+		"""
+		Creates visiter over DiGraph object graph. The iterate parameter sets the
+		default way of visiting: whether to use traverse() or iterate via next()
+		when visit() is called. Default it to call traverse() (False setting).
+		"""
+		self.graph = graph
+		self.iterate = iterate
+		self.nodes = list(graph.nodes) #copy of node list
+		self.fn = fn
+
+	def __iter__(self):
+		""" Iterator object - returns Iterator iterator """
+		return GraphVisitor.Iterator(self.nodes)
+
+	def traverse(self):
+		""" 
+		Traverses each node of graph in arbitrary order. Calls nodeAction(node)
+		on each node. Returns set of nodes, for which nodeAction() returns true.
+		"""
+		self.unvisit()
+		selNodes = set()
+		for n in GraphVisitor.Iterator(nodes):
+			if self.nodeAction(node): selNodes.add(node)
+
+		return selNodes
+		
+	def select(self):
+		""" Returns nodes for which nodeAction() evaluated to true. """
+		return self.visit()
+
+	def visit(self):
+		"""
+		If self.iterate == True, iterates over nodes in 'for node in self' style,
+		for each nodeAction is called. If self.iterate == False, traverse() is
+		called instead. Returns nodes for which nodeAction() evaluated to true.
+
+		This gives option to either override __iter__ or traverse in subclasses.
+		"""
+		if (self.iterate):
+			selNodes = set()
+			for n in self:
+				if (self.nodeAction(n)): selNodes.add(node)
+			return selNodes()
+		else:
+			return self.traverse()
+	
+	def nodeAction(self, node):
+		"""
+		This method gets called from visit()/traverse() for each node.
+		To be reimplemented in subclasses. Calls the lamda function self.fn
+		and returns its value
+		"""
+		return self.fn(node)
+
+	def unvisit(self):
+		"""
+		Sets all nodes as not-visited. Affects iterators that are currently
+		created over the nodes.
+		"""
+		for n in self.nodes: n.visited = False
+
+class MarkingVisitor(GraphVisitor):
+	"""
+	Visitor doing BFS from list of free pkg roots, marking them removable (see
+	method markPkgs for details).
+	
+	Overrides traverse() method of GraphClass. Iterator is inherited
+	(thus unusable for marking).
+	"""
+	
+	def __init__(self, graph, roots):
+		""" Creates marking visiter on DiGraph graph, starting from nodes roots """
+		GraphVisitor.__init__(self, graph)
+		self.iterate = False
+		self.roots = list(roots)
+
+	def traverse(self):
+		""" Traverses graph and marks free pkg paths removable (each node on the path) """
+		self.unvisit()
+		self.markPkgs(self.roots)
+
+	def markPkgs(self, nodes):
+		"""
+		Marks each node from list nodes removable if:
+			-its parents are removable
+			-node itself is free pkg
+		Does that recursively on children of node, skips visited, marks seen as
+		visited. Does BFS visit starting from given nodes in order not to miss
+		any unrequired dependency.
+		"""
+		que = list(nodes) #the queue
+		while len(que) > 0:
+			n = que.pop(0)
+			if n.visited: continue #skip visited, non-free
+			n.visited = True
+			if not self.graph.isFreePkg(n.pkg()): continue
+
+			if n.parentsRemovable(): n.removable = True
+			#queue free children
+			for p in n.children:
+				if self.graph.isFreePkg(p.pkg()): que.append(p)
+
+class VicinityVisitor(GraphVisitor):
+	"""
+	Does BFS to determine all paths of packages up to depth n from selected set.
+	Traversing is done both in edge direction (towards children) and in the
+	opposite direction (towards parents), or the direction may be specified.
+
+	filterFn is an explicit filter function that says whether a node should be
+	traversed or not.
+	"""
+	
+	def __init__(self, graph, nodes, depth, withParents=True, withChildren=True,
+		filterFn=lambda node: True):
+		""" Creates visitor of graph starting from list of nodes visiting up to given depth """
+		GraphVisitor.__init__(self, graph)
+		self.iterate = False
+		self.start = list(nodes)
+		self.depth = depth
+		self.withParents=withParents
+		self.withChildren=withChildren
+		self.filterFn=filterFn
+
+	def traverse(self):
+		""" Traverses graph up to self.depth and returns list of found nodes """
+		self.unvisit()
+		return self.bfs(self.start, self.depth)
+
+	def bfs(self, start, depth):
+		"""
+		Traverses graph up to self.depth and returns list of found nodes.
+		Skips visited nodes and nodes filtered by self.filterFn.
+		"""
+		unseen = lambda n: not n.visited #visited check for filtering
+		compFilter = lambda n: unseen(n) and self.filterFn(n) #composite filter
+
+		result = filter(compFilter, start) #seen nodes - result
+		que = set(result) #queue
+
+		nextQue = set() #queue for next round
+		
+		for d in range(0, depth):
+			for n in que:
+				n.visited = True
+				roundPar = []
+				if self.withParents: roundPar = filter(compFilter, n.parents)
+				roundCh=[]
+				if self.withChildren: roundCh =  filter(compFilter, n.children)
+				nextQue = nextQue.union(roundPar + roundCh)
+			result += nextQue
+			que = set(nextQue)
+			nextQue = set()
+
+		return result
+
+
+class DiGraph:
+	"""Class representing the graph of dependencies and reverse dependencies"""
+
+	def __init__(self, flags, imgFile=None):
+		"""
+		Initializes internal data structures such as package lists and maps
+		If imgFile is non-empty, generates also graphviz graph structure.
+		Flags is combination of "rcp" letters denoting which of runtime,
+		compile-time and postmerge dependencies to consider.
+		"""
+		self.packages = gentoolkit.find_all_installed_packages()
+
+		self.checkFlags(flags)
+		self.depFlags = flags
+		
+		#only resolved (existing installed) world packages are considered
+		world = gentoolkit.find_world_packages()[0]
+		self.world = set()
+		for pkg in world:
+			self.world.add(pkg.get_cpv())
+		#same for system pkgs
+		system = gentoolkit.find_system_packages()[0]
+		self.system = set()
+		for pkg in system:
+			self.system.add(pkg.get_cpv())
+
+		self.pkgMap = {} #maps string "category/package-version" (cpv) to node
+		#special internal use flags, taken from http://www.gentoo.org/dyn/use-index.xml
+		#not used at the moment
+		self.specialUse = ["build", "bootstrap", "livecd", "selinux"]
+		
+		#graphviz image generation settings
+		self.imgFile = imgFile
+		self.gvgen = GvGen()
+		
+		#caching of roots
+		self.rootList = None
+
+	def checkFlags(self, flags):
+		""" Checks the validity of dependency flags. Raises ValueError if empty or unknown """
+		#check flags
+		if len(flags) == 0:
+			raise ValueError("Dependency flags empty")
+		for f in flags:
+			if f not in ["c", "r", "p"]:
+				raise ValueError("Unknown dependency flag selected: '" + f + "'")
+
+	def createGraph(self):
+		""" Creates the graph by visiting through package dependencies """
+		self.digraph = portage.digraph()
+		for pkg in self.packages:
+			added = self.addNode(pkg) #has no parent so far
+
+	def flagsUsed(self, required, given):
+		""" Returns true iff all of the required flags are in the given set, honoring also !flag """
+		for f in required:
+			if (f[0] == "!"):
+				if f in given: return False
+			else:
+				if f not in given: return False
+		
+		return True
+
+	def cleanUseFlags(self, flags):
+		""" Cleans special internal useflags from given set and returns the set. Modifies argument. """
+		for flag in self.specialUse:
+			try:
+				flags.remove(flag)
+			except KeyError:
+				pass
+
+			try:
+				flags.remove("!" + flag)
+			except KeyError:
+				pass
+
+		return flags
+
+	def setupGvStyle(self, node):
+		"""
+		Sets style for Node node in its data (for the gvgen node)
+		Does nothing if the node has no data associated.
+		Assumes node.data is of the right type.
+		"""
+		if node.data == None: return
+
+		pkg = node.pkg()
+		data = node.data
+
+		#shape
+		self.gvgen.propertyAppend(data, "shape", "octagon") 
+
+		if node.selected:
+			self.gvgen.propertyAppend(data, "color", "purple") 
+		elif self.isWorldPkg(pkg):
+			self.gvgen.propertyAppend(data, "color", "green") 
+		elif self.isSystemPkg(pkg):
+			self.gvgen.propertyAppend(data, "color", "blue") 
+		elif node.removable:
+			self.gvgen.propertyAppend(data, "color", "red") 
+		else: 
+			self.gvgen.propertyAppend(data, "color", "orange") 
+
+	def gvNodeName(self, node):
+		"""
+		Returns a suitable name for node to be used for graphviz node.
+		"""
+		pkg = node.pkg()
+		#splits the name in more lines, otherwise they are too long
+		return pkg.get_category() + "\\n" + pkg.get_name() + "\\n" + pkg.get_version()
+
+	def graphGvNode(self, node):
+		""" 
+		Creates GvGem graph structure for node if it does not exist yet.
+		Sets also styles according to package type (world/system/free)
+		"""
+		if node.data == None:
+			node.data = self.gvgen.newItem(self.gvNodeName(node))
+
+		self.setupGvStyle(node)
+
+	def graphGvEdge(self, parent, child):
+		""" 
+		Creates graphviz edge between nodes parent and child.
+		Also creates the graphviz nodes if they did not exist before
+		"""
+		self.graphGvNode(parent)
+		self.graphGvNode(child)
+		self.gvgen.newLink(parent.data, child.data)
+		
+	def getNodes(self):
+		""" Returns a list of all nodes. Property accessor. """
+		return self.pkgMap.values()
+
+	nodes = property(getNodes)
+
+	def getPkgDeps(self, pkg):
+		"""
+		Returns packages this package depends on. Each letter in flags denotes
+		type of dependency to consider: (r)untime, (c)ompile-time, (p)ostmerge
+		deps.
+		"""
+		deps = []
+		flags = self.depFlags
+
+		if "r" in flags:
+			deps += pkg.get_runtime_deps()
+		if "c" in flags:
+			deps += pkg.get_compiletime_deps()
+		if "p" in flags:
+			deps += pkg.get_postmerge_deps()
+
+		return deps
+
+	def addNode(self, pkgObj):
+		"""
+		Adds a node representing the pkgObj to the graph.
+		Calls itself recursively for each dependency not yet existing in the
+		graph.
+		If the pkgObj is already in the graph, does nothing (since all its deps
+		are already there).
+
+		pkgObj may be either Package or Node object. In the first case a wrapper
+		Node around the package is created.
+
+		Returns true iff the package was newly added.
+		"""
+		#1) check type - Node or Package
+		#2) check if we already have the package in graph
+		#that got there because of other dependency
+		if isinstance(pkgObj, Node):
+			pkgNode = pkgObj
+		elif isinstance(pkgObj, gentoolkit.package.Package):
+			pkgNode = Node(pkgObj)
+		else:
+			raise ValueError("Unsupported object type passed to addNode")
+		
+		pkg = pkgNode.pkg()
+		cpv = pkg.get_cpv()
+		if self.pkgMap.has_key(cpv): return False
+		#now we have cpv, pkgNode, pkg and the node is new package
+
+		self.pkgMap[cpv] = pkgNode
+		sp = re.compile("\s+");
+		useFlags = set(sp.split(pkg.get_use_flags().rstrip()));
+
+		#traverse runtime dependencies and add them to graph
+		allDeps = self.getPkgDeps(pkg)
+		for dep in allDeps:
+			pkgUse = set(dep[1])
+
+			if self.flagsUsed(pkgUse, useFlags): #if flags match
+				query = dep[0] + dep[2]
+				childPkgs = gentoolkit.find_installed_packages(query)
+
+				#add the child dependencies
+				for chPkg in childPkgs:
+					chCpv = chPkg.get_cpv()
+
+					#check if we have the node of child pkg - only add dependency edges
+					if self.pkgMap.has_key(chCpv):
+						chNode = self.pkgMap[chCpv]
+						chNode.addParent(pkgNode)
+						pkgNode.addChild(chNode)
+					#otherwise add the package node with deps
+					else:
+						chNode = Node(chPkg)
+						chNode.addParent(pkgNode)
+						pkgNode.addChild(chNode)
+						self.addNode(chNode)
+		return True
+
+	def isWorldPkg(self, pkg):
+		""" Returns true iff pkg is in world """
+		return (pkg.get_cpv() in self.world)
+
+	def isSystemPkg(self, pkg):
+		""" Returns true iff pkg is in system """
+		return (pkg.get_cpv() in self.system)
+
+	def isFreePkg(self, pkg):
+		""" Returns true iff pkg is neither in system or world """
+		return (not self.isSystemPkg(pkg) and not self.isWorldPkg(pkg))
+
+	def findFreePkgPaths(self):
+		"""
+		Returns list of PkgPath objects of non-world non-system packages that no
+		other package depends on. First in the PkgPath is the root that no
+		pkg depends on, the rest is part of path of packages the root package depends on.
+
+		Basically, if you removed one root non-world package from a path, there would
+		(probably) be another non-world root package and so on if you continued removing the
+		roots. Thus the inner list contains packages that are probably unused and may be
+		unmerged.
+
+		Marks the free in paths packages removable and calls methods to prepare
+		graphviz output.
+		"""
+		roots = self.findRoots()
+		freeRoots = roots.free
+		mw = MarkingVisitor(self, freeRoots)
+		mw.visit()
+
+		#reap the marked paths per root package
+		#all (including indirect) removable children
+		paths = []
+		self.unvisit()
+		for n in freeRoots:
+			path = PkgPath()
+			path.addNode(n)
+			paths.append(path)
+			que = n.removableChildren()
+			while len(que) > 0:
+				n2 = que.pop(0)
+				if n2.visited: continue
+				n2.visited = True
+				path.addNode(n2)
+				que += n2.removableChildren()
+		
+		return paths
+	
+	def unvisit(self):
+		""" Marks all nodes unvisited """
+		GraphVisitor(self).unvisit()
+		
+	def findRoots(self):
+		"""
+		Searches for roots of the graph.
+		A root is a package, that no other package depends on (they are leaves
+		of the inverted graph)
+
+		Returns a NodeList containing the root package nodes.
+		
+		Caches the NodeList internally, you should not change the returned object.
+		The NodeList is cached until next call of findRoots.
+		"""
+		self.unvisit()
+		nl = NodeList()
+
+		for n in GraphVisitor(self):
+			if len(n.parents) == 0:
+				if self.isWorldPkg(n.pkg()):
+					nl.addWorldPkg(n)
+				elif self.isSystemPkg(n.pkg()):
+					nl.addSystemPkg(n)
+				else:
+					nl.addFreePkg(n)
+		
+		self.rootList = nl
+		return nl
+
+	def outputDotGraph(self, nodes, withChildren=False, withParents=False):
+		""" 
+		Outputs dot-format digraph to file displaying the dependencies
+		among the supplied set/list of nodes (specified as list/set of cpv strings).
+		File is written to self.imgFile or to stdout if the former == None.
+		If withChildren/withParents is true, children and parents of the nodes are
+		added to graph as well.
+		"""
+		edges = set() #remember existing edges
+		sn = set(nodes) #for O(1) lookup
+
+		if withParents:
+			for n in nodes:
+				sn = sn.union(n.parents)
+
+		#gvgen-graph all nodes
+		for n in sn:
+			self.graphGvNode(n)
+
+		#then all edges, graph may be multi-component
+		for n in sn:
+			pV = n.cpv()
+			for ch in n.children:
+				if ch not in sn and not withChildren:
+					continue #we do not want to graph nodes outside explictly selected set
+				cV = ch.cpv()
+				edgeName = pV + "---" + cV #"list objects are unhashable"
+				if edgeName in edges:
+					continue
+				edges.add(edgeName)
+				self.graphGvEdge(n, ch)
+
+		if self.imgFile == None:
+			file = sys.stdout
+		else:
+			file = open(self.imgFile, "w")
+
+		self.gvgen.dot(file)
+		file.close()
+
+
+###################
+# Command line/options parsing and help text
+#
+class Command:
+	"""
+	Abstract root class for all commands
+	"""
+
+	def __init__(self):
+		pass
+
+	def shortHelp(self):
+		"""
+		Return a help formatted to fit a single line, approx 70 characters.
+		Must be overridden in the subclass.
+		"""
+		return " - not implemented yet"
+
+	def longHelp(self):
+		"""
+		Return full, multiline, color-formatted help.
+		Must be overridden in the subclass.
+		"""
+		return "help for syntax and options"
+
+	def execute(self):
+		"""
+		Stub code for performing the command. Should be overridden in the
+		subclass.  By default supports global args (assumes that self.options
+		has been initialized, i.e. parseArgs must call parse_args).
+		"""
+		if self.options.nocolor:
+			pp.output.nocolor()
+		if self.options.help:
+			print_info(0, self.longHelp())
+			sys.exit(2)
+
+	def parseArgs(self, args):
+		"""
+		Stub code for parsing command line arguments for this command.
+		Must be overridden in the subclass.
+		This stub version only creates OptionParser with global cmds,
+		it is up to subclass to either use it or not (and add local opts).
+		"""
+		self.parser = OptionParser(add_help_option=False) #we add help explictly
+		self.parser.add_option("-h", "--help",
+			action="store_true", dest="help", default=False)
+		self.parser.add_option("-C", "--nocolor",
+			action="store_true", dest="nocolor", default=False)
+
+class CmdPaths(Command):
+	"""
+	Report/visualize paths of free packages that might be unmerged
+	(similar to 'emerge --depclean --pretend')
+	"""
+
+	def __init__(self):
+		Command.__init__(self)
+
+	def shortHelp(self):
+		return pp.localoption("<local-opts> ") + \
+			"- report/visualize paths of free root packages (which could be uninstalled)"
+	
+	def longHelp(self):
+		return "Report/visualize paths of free (nonworld nonsystem) root packages" + \
+			"\n" + \
+			"Syntax:\n" + \
+			"  " + pp.productname(__productname__) + pp.command(" paths") + pp.localoption(" <local-opts> ") + \
+			"\n" + \
+			pp.localoption(" <local-opts>") + " is either of: \n" + \
+			"  " + pp.localoption("-d --deps (c|r|p)*") + "     - consider types of dependencies = (c)ompile, (r)untime, (p)ostmerge; default: crp \n" + \
+			"  " + pp.localoption("-o --output file") + "       - output graphviz graph to this file instead of stdout\n" + \
+			"  " + pp.localoption("-t --type (text|graph)") + " - text or graph output; default text\n" + \
+			"  " + pp.localoption("-c --children") + "          - show also all children of packages in path; only applicable for graph output\n"
+
+	def parseArgs(self, args):
+		"""
+		Calls ancestor's parseArgs to create parser with global opts.
+		Adds own local options such as output file, depth...
+		"""
+		Command.parseArgs(self, args)
+		self.parser.add_option("-d", "--deps", action="store", type="string", dest="deps",
+			default="crp")
+		self.parser.add_option("-o", "--output", action="store", type="string", dest="out",
+			default=None)
+		self.parser.add_option("-t", "--type", action="store", type="string", dest="type",
+			default="text")
+		self.parser.add_option("-c", "--children", action="store_true", dest="children",
+			default=False)
+		(self.options, la) = self.parser.parse_args(args=args)
+
+	def execute(self):
+		""" Executes search for root packages """
+		Command.execute(self)
+
+		graph = DiGraph(self.options.deps, self.options.out)
+		graph.createGraph()
+
+		roots = graph.findRoots()
+		paths = graph.findFreePkgPaths()
+		if self.options.type == "text":
+			print_info(0,  pp.section("Paths of free packages:"))
+			for path in paths:
+				pl = path.path
+				print pl.pop(0).cpv()
+				for n in pl:
+					print "\t" + n.cpv()
+		elif self.options.type == "graph":
+			nodes = set()
+			for p in paths:
+				nodes = nodes.union(p.path)
+			graph.outputDotGraph(nodes, withChildren=self.options.children)
+
+
+class CmdRoots(Command):
+	"""
+	Roots command - report root packages (=packages that no other package depend on).
+	"""
+
+	def __init__(self):
+		Command.__init__(self)
+
+	def checkTypes(self, types):
+		""" Checks selected package types for validity, raises ValueError if unknown or empty """
+		if len(types) == 0:
+			raise ValueError("Selected no types")
+		for t in types:
+			if t not in ["w", "s", "f"]:
+				raise ValueError("Unknown package type selected: '" + t + "'")
+
+	def shortHelp(self):
+		return pp.localoption("<local-opts> ") + \
+			"- report root packages (i.e. packages that no other package depends on)"
+	
+	def longHelp(self):
+		return "Report root packages for various (combinations of) dependencies" + \
+			"\n" + \
+			"Syntax:\n" + \
+			"  " + pp.productname(__productname__) + pp.command(" roots") + pp.localoption(" <local-opts> ") + \
+			"\n" + \
+			pp.localoption(" <local-opts>") + " is either of: \n" + \
+			"  " + pp.localoption("-d --deps (c|r|p)*") + "  - consider types of dependencies: (c)ompile, (r)untime, (p)ostmerge; default: crp \n" + \
+			"  " + pp.localoption("-t --types (w|s|f)*") + " - report package of type: (w)orld, (s)ystem, (f)ree; default: wsf\n"
+
+	def parseArgs(self, args):
+		"""
+		Calls ancestor's parseArgs to create parser with global opts.
+		Adds own local options such as output file, depth...
+		"""
+		Command.parseArgs(self, args)
+		self.parser.add_option("-d", "--deps", action="store", type="string", dest="deps",
+			default="crp")
+		self.parser.add_option("-t", "--types", action="store", type="string", dest="types",
+			default="wsf")
+		(self.options, la) = self.parser.parse_args(args=args)
+		self.checkTypes(self.options.types)
+
+	def execute(self):
+		""" Executes search for root packages """
+		Command.execute(self)
+
+		#create graph and find the roots
+		graph = DiGraph(self.options.deps)
+		graph.createGraph()
+		roots = graph.findRoots()
+
+		#report on selected type of packages
+		if "s" in self.options.types:
+			print_info(0,  pp.section("Roots from system:"))
+			for l in roots.system:
+				print l.cpv()
+			print
+
+		if "w" in self.options.types:
+			print_info(0,  pp.section("Roots from world:"))
+			for l in roots.world:
+				print l.cpv()
+			print
+
+		if "f" in self.options.types:
+			print_info(0,  pp.section("Roots neither from system nor world (free packages):"))
+			for l in roots.free:
+				print l.cpv()
+
+class CmdVicinity(Command):
+	"""
+	Report/visualize on nearby packages in dependency graph.
+	"""
+
+	def __init__(self):
+		Command.__init__(self)
+
+	def shortHelp(self):
+		return \
+			pp.localoption("<local-opts> ") + pp.pkgquery("pkgspec ") + \
+			"- report/visualize package dependency vicinity"
+	
+	def longHelp(self):
+		return "Report/visualize vicinity of package(s) in dependency graph." + \
+			"\n" + \
+			"Syntax:\n" + \
+			"  " + pp.productname(__productname__) + pp.command(" vicinity") + \
+				pp.localoption(" <local-opts> ") + pp.pkgquery("pkgspec ") + "\n" + \
+			pp.localoption(" <local-opts>") + " is either of: \n" + \
+			"  " + pp.localoption("-d --deps (c|r|p)*") + "     - consider types of dependencies = (c)ompile, (r)untime, (p)ostmerge; default: crp \n" + \
+			"  " + pp.localoption("-o --output file") + "       - output graphviz graph to this file instead of stdout\n" + \
+			"  " + pp.localoption("-t --type (text|graph)") + " - text or graph output; default text\n" + \
+			"  " + pp.localoption("-n --depth n") + "           - limit displayed dependency depth to n; default: 1\n" + \
+			"  " + pp.localoption("-c --no-children") + "       - do not show&traverse children of packages in path\n" + \
+			"  " + pp.localoption("-p --no-parents") + "        - do not show&traverse parents of packages in path\n" + \
+			"  " + pp.localoption("-r --regexp regexp") + "     - do not show&traverse nodes matching regexp; option may be used multiple times\n"
+
+	def parseArgs(self, args):
+		"""
+		Calls ancestor's parseArgs to create parser with global opts.
+		Adds own local options such as output file, depth...
+		"""
+		Command.parseArgs(self, args)
+		self.parser.add_option("-d", "--deps", action="store", type="string", dest="deps",
+			default="crp")
+		self.parser.add_option("-o", "--output", action="store", type="string", dest="out",
+			default=None)
+		self.parser.add_option("-t", "--type", action="store", type="string", dest="type",
+			default="text")
+		self.parser.add_option("-n", "--depth", action="store", type="int", dest="depth",
+			default=1)
+		self.parser.add_option("-c", "--no-children", action="store_false", dest="children",
+			default=True)
+		self.parser.add_option("-p", "--no-parents", action="store_false", dest="parents",
+			default=True)
+		self.parser.add_option("-r", "--regexp", action="append", type="string", dest="regexp",
+			default=None)
+		(self.options, self.pkgspec) = self.parser.parse_args(args=args)
+
+	def execute(self):
+		""" Executes vicinity search """
+		Command.execute(self)
+
+		graph = DiGraph(self.options.deps, self.options.out)
+		graph.createGraph()
+		
+		sel = [] #pkgspec package selection
+
+		#find all packages matching the pkgspec
+		for ps in self.pkgspec:
+			sel += gentoolkit.find_installed_packages(ps)
+		if len(sel)==0: #no matches
+			raise ValueError("No packages maching " + " ".join(self.pkgspec) + " were found.")
+		nodes = map(lambda p: graph.pkgMap[p.get_cpv()], sel)
+		for n in nodes:
+			n.selected = True #to draw them with different color
+
+		#compose regexp filter for nodes
+		ft = lambda n: not multisearch(self.options.regexp, n.cpv())
+
+		visitor = VicinityVisitor(graph, nodes, self.options.depth, 
+			withParents=self.options.parents, withChildren=self.options.children,
+			filterFn=ft)
+		neighbors = visitor.visit()
+
+		if self.options.type == "text":
+			print_info(0,  pp.section("Vicininy of packages " + pp.pkgquery(" ".join(map(lambda p:p.get_cpv(), sel))) + ": "))
+			for n in neighbors:
+				print n.cpv()
+		elif self.options.type == "graph":
+			graph.outputDotGraph(neighbors)
+
+class CmdVersion(Command):
+	"""
+	Prints out version of this program
+	"""
+
+	def __init__(self):
+		pass
+
+	def shortHelp(self):
+		return "- prints out version"
+	
+	def longHelp(self):
+		return "- prints out version"
+
+	def execute(self):
+		print_info(0, __productname__ + " " + __version__ + ": " + __description__ )
+		print_info(0, "Author(s): " + __author__ )
+
+class CommandParser:
+	"""
+	Parses command line args and runs selected command with arguments.
+	"""
+
+	def __init__(self, args):
+		"""
+		Saves the options, sets up mapping of commands to command objects.
+		The options are passed via args (usually sys.argv are passed).
+		"""
+		self.args = list(args) #copy args
+		#known commands map to Command objects
+		self.knownCommands = {
+			"roots" : CmdRoots(),
+			"vicinity" : CmdVicinity(),
+			"paths" : CmdPaths(),
+			"version" : CmdVersion()
+			}
+		
+	def execute(self):
+		""" Parses arguments and executes given command """
+		#run toplevel help if no commands or explicitly specified
+		if len(self.args) < 2 or self.args[1] in ["-h", "--help"]:
+			self.help()
+
+		self.cmd = self.args[1]
+		if not self.cmd in self.knownCommands.keys():
+			raise ValueError("Unknown command: " + self.cmd)
+		
+		cmdObj = self.knownCommands[self.cmd]
+		cmdObj.parseArgs(self.args[2:])
+		cmdObj.execute()
+
+	def help(self):
+		""" Prints out help and exits """
+		print_info(0, pp.emph("Usage: ") + pp.productname(__productname__) + \
+			pp.command(" command") + pp.globaloption(" <global-opts>") + \
+			pp.localoption(" <local-opts>"))
+		print_info(0, "where " + pp.command("command") + " is one of")
+		keys = self.knownCommands.keys()
+		keys.sort()
+		for x in keys:
+			print_info(0, " " + pp.command(x) + " " + self.knownCommands[x].shortHelp())
+		print
+		print_info(0, "Note: free package means a package that is neither in world nor system")
+		print
+
+		#global opts
+		print_info(0, "where " + pp.globaloption("<global-opts>") + " is one of")
+		print_info(0, pp.globaloption(" -C, --nocolor") + \
+			" - turn off colors (default for output to pipe)")
+		print_info(0, pp.globaloption(" -h, --help") + \
+			" - get help on specific command and its local options")
+		print
+		print_info(0, pp.emph("Examples: "))
+		print_info(0, "rev-depgraph paths --help  #prints help for paths command")
+		print_info(0, "rev-depgraph roots -d rc -t f  #prints free package roots of graph considering runtime and compiletime dependencies")
+		print_info(0, "rev-depgraph paths  #prints out free roots with paths (this is similar to emerge --depclean --pretend)")
+		print_info(0, "rev-depgraph vicinity -t graph -o graph.dot -d r sys-apps/grep  #ouputs graph.dot which shows runtime dependencies around package sys-apps/grep")
+		print
+		print_info(0, pp.emph("Node colors used in generated graphviz graphs:"))
+		print_info(0, " purple - nodes selected by pkgspec (vicinity command)\n" +
+			" green - world packages\n" +
+			" blue - system packages\n" +
+			" red - removable packages (paths command)\n" +
+			" orange - other free packages (which are not removable in case of paths command)")
+		sys.exit(2)
+
+def configure():
+	""" Set some sensible default values """
+	# Disable colors if output is not tty or disabled in gentoolkit settings
+	if ((not sys.stdout.isatty()) or (gentoolkit.settings["NOCOLOR"] in ["yes","true"])):
+		pp.output.nocolor()
+	
+def nodelist(nodes):
+	""" Returns cpv's of nodes delimited by space as string """
+	return " ".join([n.cpv() for n in nodes])
+
+def multisearch(regexps, s):
+	"""
+	Searches all regexps from list/set of regexps on string s, returns True
+	if at least one matches.
+	"""
+	if regexps == None: return False
+	for r in regexps:
+		if (re.search(r, s)):
+			return True
+	return False
+
+###### main begin #########
+if __name__ == "__main__":
+
+	configure()
+	try:
+		cp = CommandParser(sys.argv)
+		cp.execute()
+	except SystemExit:
+		#if something called sys.exit, use the error code for caller to test
+		sys.exit(sys.exc_info()[1])
+	except:
+		pp.print_error(str(sys.exc_info()[0]) + ": " + str(sys.exc_info()[1]))
+		#sys.exit(1)
+		#to see the backtrace uncomment following raise and comment sys.exit(1) above
+		raise
+
